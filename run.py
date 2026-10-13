@@ -181,11 +181,11 @@ tavily_search_tool = TavilySearch(
 
 
 def format_history_output(tavily_response: dict) -> str:
-    """Keep specific historical events and discard generic search-page boilerplate."""
+    """Extract concrete date-linked history facts; reject generic page headings."""
     results = tavily_response.get("results", []) or []
     answer = str(tavily_response.get("answer", "") or "").strip()
-    facts = []
-    seen = set()
+    facts: list[dict[str, str]] = []
+    seen: set[str] = set()
 
     generic_phrases = (
         "what happened today in history",
@@ -194,103 +194,124 @@ def format_history_output(tavily_response: dict) -> str:
         "historical events on this day",
         "history today",
         "events that happened today",
+        "has seen remarkable historical events",
+        "remarkable historical events",
         "read more",
         "click here",
         "latest news",
+        "on this day",
     )
-    historical_signals = (
+    event_signals = (
         "born", "birth", "died", "death", "anniversary", "founded", "established",
         "declared", "launched", "signed", "became", "independence", "battle",
         "revolution", "elected", "appointed", "opened", "inaugurated", "discovered",
-        "first", "reached", "passed away", "historical", "occurred",
+        "passed away", "assassinated", "adopted", "formed", "created", "first indian",
+        "constitution", "movement", "war", "agreement", "treaty", "won", "started",
+        "announced", "proclaimed", "government", "formation", "declared",
     )
 
-    def useful_line(value: str) -> bool:
-        value = re.sub(r"\s+", " ", str(value or "")).strip(" -•|\t")
-        lowered = value.lower()
-        if len(value) < 35 or len(value) > 500:
+    def clean_candidate(value: str) -> str:
+        value = re.sub(r"<[^>]+>", " ", str(value or ""))
+        value = re.sub(r"^\s{0,3}#{1,6}\s*", "", value)
+        value = re.sub(r"^\s*[-*•]+\s*", "", value)
+        value = re.sub(r"\s+", " ", value).strip(" -|\t")
+        return value
+
+    def is_concrete_event(value: str) -> bool:
+        value = clean_candidate(value)
+        lower = value.lower()
+        if not 35 <= len(value) <= 600:
             return False
-        if any(phrase in lowered for phrase in generic_phrases):
+        if any(phrase in lower for phrase in generic_phrases):
             return False
-        if lowered.startswith(("http://", "https://", "source:", "read more")):
+        if lower.startswith(("http://", "https://", "source:", "read more")):
             return False
-        # Require a concrete date/year or an event-related term; avoid generic snippets.
         has_year = bool(re.search(r"\b(?:1[5-9]\d{2}|20\d{2})\b", value))
         has_date = bool(re.search(
             r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
             r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2}\b",
-            lowered,
+            lower,
         ))
-        has_event_signal = any(signal in lowered for signal in historical_signals)
+        has_event_signal = any(signal in lower for signal in event_signals)
+        # A specific year plus an event verb/milestone is required; a page title alone is not enough.
         return (has_year or has_date) and has_event_signal
 
     for item in results:
-        title = re.sub(r"\s+", " ", str(item.get("title", "") or "")).strip()
+        title = clean_candidate(item.get("title", ""))
         content = str(item.get("content", "") or "").strip()
-        # Tavily often returns a generic page title but a useful event in its snippet.
-        candidates = re.split(r"(?<=[.!?])\s+|\n+", content)
-        valid_details = [re.sub(r"\s+", " ", line).strip() for line in candidates if useful_line(line)]
-        if not valid_details and useful_line(title):
-            valid_details = [title]
-        if not valid_details:
-            continue
-
-        detail = valid_details[0]
-        heading = title if useful_line(title) else detail
-        key = re.sub(r"[^a-z0-9]", "", (heading + detail).lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        facts.append({"heading": heading[:180], "detail": detail[:650]})
+        # Search snippets often contain multiple sentences; inspect each independently.
+        candidates = [title]
+        candidates.extend(re.split(r"(?<=[.!?])\s+|\n+", content))
+        for candidate in candidates:
+            candidate = clean_candidate(candidate)
+            if not is_concrete_event(candidate):
+                continue
+            # Avoid using a generic search-page title as the event heading.
+            heading = title if title and not any(p in title.lower() for p in generic_phrases) else candidate
+            key = re.sub(r"[^a-z0-9]", "", (heading + candidate).lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            facts.append({"heading": heading[:180], "detail": candidate[:650]})
+            break
         if len(facts) >= 5:
             break
 
-    output_lines = []
+    # Tavily's generated answer is also untrusted: only accept it if it names a concrete event.
+    if not facts and answer:
+        for candidate in re.split(r"(?<=[.!?])\s+|\n+", answer):
+            candidate = clean_candidate(candidate)
+            if is_concrete_event(candidate):
+                facts.append({"heading": candidate[:180], "detail": candidate[:650]})
+                break
+
+    output_lines: list[str] = []
     for idx, fact in enumerate(facts, start=1):
         output_lines.extend([
             f"fact{idx}:",
             f"- heading: {fact['heading']}",
             f"- details: {fact['detail']}",
         ])
-
     output_lines.append("summary:")
     if facts:
-        output_lines.append("Specific historical events extracted from Tavily search results.")
-    elif answer and not any(phrase in answer.lower() for phrase in generic_phrases) and useful_line(answer):
-        output_lines.append(answer[:650])
+        output_lines.append("Specific date-linked historical events extracted from Tavily results.")
     else:
-        output_lines.append("No sufficiently specific historical event could be verified from the search results.")
+        output_lines.append("No verified specific historical event was found in the search results.")
     return "\n".join(output_lines)
 
 
 @tool("search_india_history_on_date", description="Finds specific Indian historical events associated with a given date.")
 def search_india_history_on_date(day: int, month_name: str, year: int = None, keywords: str = "major historic events facts"):
-    """Search for date-specific Indian history; retry once with a narrower query if needed."""
+    """Search for specific Indian historical events and retry once with an alternate query."""
+    date_label = f"{day} {month_name}"
+    query = (
+        f"India historical events that occurred on {date_label}: specific named events, "
+        "people born or died on this date, anniversaries, Indian history timeline with years. "
+        "Return event details, not a generic 'this day in history' article. "
+        f"{keywords}"
+    )
     if year:
         query = (
-            f"Specific Indian historical events that occurred on {day} {month_name} {year}: "
-            f"named people, births, deaths, milestones, and event years. {keywords}. "
-            "Exclude generic 'this day in history' pages; provide concrete events and dates."
-        )
-    else:
-        query = (
-            f"Specific events in Indian history associated with {day} {month_name}: "
-            "named people born or died on this date, historical milestones, and the year each event occurred. "
-            f"{keywords}. Exclude generic 'this day in history' pages and return concrete event descriptions."
+            f"Indian historical events on {date_label} {year}, named events and people, "
+            f"include the historical year and a factual description. {keywords}"
         )
 
-    results = tavily_search_tool.invoke({"query": query})
-    formatted = format_history_output(results)
-    if re.search(r"fact\d+:\s*\n", formatted):
+    first_results = tavily_search_tool.invoke({"query": query})
+    formatted = format_history_output(first_results)
+    if re.search(r"(?m)^fact\d+:$", formatted):
+        print("[History] Found at least one specific event in the first search.")
         return formatted
 
-    # One targeted fallback search; do not invent a fact if this also fails.
     fallback_query = (
-        f"{day} {month_name} Indian history notable events births deaths exact date specific names years "
-        "site:indianculture.gov.in OR site:knowindia.india.gov.in OR site:amritmahotsav.nic.in"
+        f"India events on {date_label} historical timeline notable births deaths anniversaries "
+        "specific names and years - 'what happened today in history'"
     )
+    print("[History] First search had no specific event; trying fallback query.")
     fallback_results = tavily_search_tool.invoke({"query": fallback_query})
-    return format_history_output(fallback_results)
+    fallback_formatted = format_history_output(fallback_results)
+    if not re.search(r"(?m)^fact\d+:$", fallback_formatted):
+        print("[History] No concrete date-linked event found after fallback search.")
+    return fallback_formatted
 
 def format_news_output(tavily_response: dict) -> str:
 
@@ -1232,25 +1253,28 @@ def _clean_text(value: Any, limit: int = 700) -> str:
 
 
 def _first_history_item(raw: str) -> tuple[str, str]:
-    """Extract the first structured history fact returned by format_history_output."""
+    """Return a concrete structured fact only; never promote the summary to an event."""
+    raw = str(raw or "")
     match = re.search(
         r"fact\d+:\s*\n\s*-\s*heading:\s*(.*?)\n\s*-\s*details:\s*(.*?)(?=\n\s*fact\d+:|\n\s*summary:|$)",
-        raw or "",
+        raw,
         flags=re.IGNORECASE | re.DOTALL,
     )
     if match:
         heading = _clean_text(match.group(1), 180)
         detail = _clean_text(match.group(2), 650)
-        return heading, detail
+        # Strip Markdown heading markers if a source includes them.
+        heading = re.sub(r"^#{1,6}\s*", "", heading).strip()
+        detail = re.sub(r"^#{1,6}\s*", "", detail).strip()
+        generic = ("what happened today in history", "this day in history", "has seen remarkable historical events", "no verified specific historical event")
+        if heading and detail and not any(x in (heading + " " + detail).lower() for x in generic):
+            return heading, detail
 
-    # Fallback to the tool's own summary or error text, never an invented fact.
-    summary_match = re.search(r"summary:\s*(.*)", raw or "", flags=re.IGNORECASE | re.DOTALL)
-    if summary_match:
-        return "Historical note", _clean_text(summary_match.group(1), 650)
-    if raw and "unavailable" not in raw.lower() and "error" not in raw.lower():
-        return "Historical note", _clean_text(raw, 650)
-    return "Historical information unavailable", "A reliable historical item could not be retrieved today."
-
+    # Do not display Tavily's summary as though it were a historical event.
+    return (
+        "No verified event found",
+        "Today's search did not return a sufficiently specific historical event. Try again later.",
+    )
 
 def _first_news_item(raw: str) -> tuple[str, str]:
     """Extract the first structured news item returned by format_news_output."""
