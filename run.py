@@ -28,7 +28,7 @@ llm = init_chat_model(
 
     temperature=0.5 ,
 
-    max_tokens=700
+    max_tokens=900
 
 )
 
