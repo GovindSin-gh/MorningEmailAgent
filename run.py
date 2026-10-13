@@ -26,7 +26,9 @@ llm = init_chat_model(
 
     model_provider="groq", # 👈 Tells LangChain to use langchain-groq [1]
 
-    temperature=0.5
+    temperature=0.5 ,
+
+    max_tokens=700
 
 )
 
